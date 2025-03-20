@@ -44,6 +44,10 @@ supabase: Client = create_client(
     str(suppabase_url),
     str(suppabase_service_key)
 )
+site_url = get_required_env_var("SITE_URL" , "https://storybook.js.org/sitemap.xml")
+#site_url = get_required_env_var("SITE_URL" , "https://storybook.js.org/sitemap.xml")
+topic = "storybook_js_docs"
+#topic = get_required_env_var("TOPIC" , "testing_ai_docs")
 
 OLLAMA_MODEL = get_required_env_var("OLLAMA_MODEL", "llama2:chat")  # Default model
 
@@ -188,7 +192,7 @@ async def process_chunk(chunk: str, chunk_number: int, url: str) -> ProcessedChu
     #source = os.getenv("TOPIC", "testing_ai_docs")
     #source = "storybook_js_docs"
     metadata = {
-        "source": source,
+        "source": topic,
         "chunk_size": len(chunk),
         "crawled_at": datetime.now(timezone.utc).isoformat(),
         "url_path": urlparse(url).path
@@ -295,12 +299,11 @@ async def crawl_parallel(urls: List[str], max_concurrent: int = 5):
 
 def get_docs_urls() -> List[str]:
     """Get URLs docs from sitemap.xml"""
-    #sitemap_url = str(get_required_env_var("SITE_URL", "https://storybook.js.org/sitemap.xml"))
-    sitemap_url = os.getenv("SITE_URL", "https://storybook.js.org/sitemap.xml")
-    #sitemap_url = "https://storybook.js.org/sitemap.xml"
-    print(sitemap_url)
+    # sitemap_url = str(get_required_env_var("SITE_URL", "https://storybook.js.org/sitemap.xml"))
+    # sitemap_url = os.getenv("SITE_URL", "https://storybook.js.org/sitemap.xml")
+    # sitemap_url = "https://storybook.js.org/sitemap.xml"
     try:
-        response = requests.get(sitemap_url)
+        response = requests.get(site_url)
         response.raise_for_status()
 
         # Parse the XML

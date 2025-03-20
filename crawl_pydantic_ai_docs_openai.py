@@ -1,5 +1,4 @@
 import os
-# import sys
 import json
 import asyncio
 import requests
@@ -9,9 +8,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 from dotenv import load_dotenv
+import time
+import random  # Import random for jitter
+from openai import AsyncOpenAI, RateLimitError
 
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
-from openai import AsyncOpenAI
 from supabase import create_client, Client
 
 load_dotenv()
@@ -32,6 +33,28 @@ class ProcessedChunk:
     content: str
     metadata: Dict[str, Any]
     embedding: List[float]
+
+def get_required_env_var(name, default=None):
+    """Get an environment variable or exit if not available and no default provided.
+
+    Args:
+        name: The name of the environment variable
+        default: Optional default value to use if the variable is not set
+
+    Returns:
+        The value of the environment variable, or the default if provided
+
+    Raises:
+        SystemExit: If the variable is not set and no default is provided
+    """
+    print(f"Searching for {name} in the environment variables")
+    value = os.getenv(name)
+    print(f"Found value: {value} for {name}")
+    if value is None and default is None:
+        print(f"Error: Required environment variable {name} is not set", file=sys.stderr)
+        sys.exit(1)
+    return value
+
 
 def chunk_text(text: str, chunk_size: int = 5000) -> List[str]:
     """Split text into chunks, respecting code blocks and paragraphs."""
@@ -65,7 +88,7 @@ def chunk_text(text: str, chunk_size: int = 5000) -> List[str]:
         elif '. ' in chunk:
             # Find the last sentence break
             last_period = chunk.rfind('. ')
-            if last_period > chunk_size * 0.3:  # Only break if we're past 30% of chunk_size
+            if last_period > chunk_size * 0.3:
                 end = start + last_period + 1
 
         # Extract chunk and clean it up
@@ -78,27 +101,47 @@ def chunk_text(text: str, chunk_size: int = 5000) -> List[str]:
 
     return chunks
 
-async def get_title_and_summary(chunk: str, url: str) -> Dict[str, str]:
-    """Extract title and summary using GPT-4."""
+async def get_title_and_summary(chunk: str, url: str, max_retries=10) -> Dict[str, str]:
+    """Extract title and summary using GPT-4 with robust retry logic."""
     system_prompt = """You are an AI that extracts titles and summaries from documentation chunks.
     Return a JSON object with 'title' and 'summary' keys.
     For the title: If this seems like the start of a document, extract its title. If it's a middle chunk, derive a descriptive title.
     For the summary: Create a concise summary of the main points in this chunk.
     Keep both title and summary concise but informative."""
 
-    try:
-        response = await openai_client.chat.completions.create(
-            model=os.getenv("LLM_MODEL", "gpt-4o-mini"),
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"URL: {url}\n\nContent:\n{chunk[:1000]}..."}  # Send first 1000 chars for context
-            ],
-            response_format={ "type": "json_object" }
-        )
-        return json.loads(response.choices[0].message.content)
-    except Exception as e:
-        print(f"Error getting title and summary: {e}")
-        return {"title": "Error processing title", "summary": "Error processing summary"}
+    retries = 0
+    wait_time = 5  # Increased initial wait time
+    backoff_multiplier = 2  # Keep the exponential backoff
+    max_wait = 60  # Maximum wait time to prevent excessive delays
+
+    while retries < max_retries:
+        try:
+            response = await openai_client.chat.completions.create(
+                model=os.getenv("LLM_MODEL", "gpt-4o-mini"),
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"URL: {url}\n\nContent:\n{chunk[:1000]}..."}
+                ],
+                response_format={"type": "json_object"}
+            )
+            return json.loads(response.choices[0].message.content)
+
+        except RateLimitError as e:
+            retries += 1
+            if retries == max_retries:
+                print("Max retries reached for title/summary. Giving up.")
+                return {"title": "Error processing title", "summary": "Error processing summary"}
+
+            # Exponential backoff with jitter
+            sleep_duration = min(wait_time, max_wait) + random.uniform(0, wait_time * 0.5)  # Jitter
+            print(f"RateLimitError: {e}. Retrying in {sleep_duration:.2f} seconds...")
+            time.sleep(sleep_duration)
+            wait_time *= backoff_multiplier  # Exponential backoff
+
+        except Exception as e:
+            # Handle other exceptions (optional, but good practice)
+            print(f"Error getting title and summary: {e}")
+            return {"title": "Error processing title", "summary": "Error processing summary"}
 
 async def get_embedding(text: str) -> List[float]:
     """Get embedding vector from OpenAI."""
@@ -128,6 +171,8 @@ async def process_chunk(chunk: str, chunk_number: int, url: str) -> ProcessedChu
         "crawled_at": datetime.now(timezone.utc).isoformat(),
         "url_path": urlparse(url).path
     }
+
+    time.sleep(20)  # Consistent delay after processing chunk
 
     return ProcessedChunk(
         url=url,
@@ -159,26 +204,27 @@ async def insert_chunk(chunk: ProcessedChunk):
         print(f"Error inserting chunk: {e}")
         return None
 
-async def process_and_store_document(url: str, markdown: str):
-    """Process a document and store its chunks in parallel."""
-    # Split into chunks
-    chunks = chunk_text(markdown)
+# # Old version
+# async def process_and_store_document(url: str, markdown: str):
+#     """Process a document and store its chunks in parallel."""
+#     # Split into chunks
+#     chunks = chunk_text(markdown)
 
-    # Process chunks in parallel
-    tasks = [
-        process_chunk(chunk, i, url)
-        for i, chunk in enumerate(chunks)
-    ]
-    processed_chunks = await asyncio.gather(*tasks)
+#     # Process chunks in parallel
+#     tasks = [
+#         process_chunk(chunk, i, url)
+#         for i, chunk in enumerate(chunks)
+#     ]
+#     processed_chunks = await asyncio.gather(*tasks)
 
-    # Store chunks in parallel
-    insert_tasks = [
-        insert_chunk(chunk)
-        for chunk in processed_chunks
-    ]
-    await asyncio.gather(*insert_tasks)
+#     # Store chunks in parallel
+#     insert_tasks = [
+#         insert_chunk(chunk)
+#         for chunk in processed_chunks
+#     ]
+#     await asyncio.gather(*insert_tasks)
 
-async def crawl_parallel(urls: List[str], max_concurrent: int = 5):
+async def crawl_parallel(urls: List[str], max_concurrent: int = 3):  # Further reduced concurrency
     """Crawl multiple URLs in parallel with a concurrency limit."""
     browser_config = BrowserConfig(
         headless=True,
@@ -204,7 +250,8 @@ async def crawl_parallel(urls: List[str], max_concurrent: int = 5):
                 )
                 if result.success:
                     print(f"Successfully crawled: {url}")
-                    await process_and_store_document(url, result.markdown_v2.raw_markdown)
+                    #  await process_and_store_document(url, result.markdown_v2.raw_markdown)
+                    await add_to_queue(url, result.markdown_v2.raw_markdown)
                 else:
                     print(f"Failed: {url} - Error: {result.error_message}")
 
@@ -230,9 +277,39 @@ def get_pydantic_ai_docs_urls() -> List[str]:
         return urls
     except Exception as e:
         print(f"Error fetching sitemap: {e}")
-        return []
+        return
+
+# New Queue-based Processing
+chunk_queue: asyncio.Queue[Dict] = asyncio.Queue()
+
+async def add_to_queue(url: str, markdown: str):
+    """Adds chunks from a document to the processing queue."""
+    chunks = chunk_text(markdown)
+    for i, chunk in enumerate(chunks):
+        await chunk_queue.put({"url": url, "chunk": chunk, "chunk_number": i})
+
+async def process_queue():
+    """Worker function to process chunks from the queue."""
+    while True:
+        item = await chunk_queue.get()
+        url = item["url"]
+        chunk = item["chunk"]
+        chunk_number = item["chunk_number"]
+
+        try:
+            processed_chunk = await process_chunk(chunk, chunk_number, url)
+            if processed_chunk:
+                await insert_chunk(processed_chunk)
+        except Exception as e:
+            print(f"Error processing queue item: {e}")
+        finally:
+            chunk_queue.task_done()
 
 async def main():
+    print(f"Topic to use: {get_required_env_var('TOPIC')} from function")
+    print(f"Topic to use: {os.getenv('TOPIC')} from env")
+    print(f"Site URL to crawl {get_required_env_var('SITE_URL')} from function")
+    print(f"Site URL to crawl {os.getenv('SITE_URL')} from env")
     # Get URLs from Pydantic AI docs
     urls = get_pydantic_ai_docs_urls()
     if not urls:
@@ -240,7 +317,23 @@ async def main():
         return
 
     print(f"Found {len(urls)} URLs to crawl")
+    #  await crawl_parallel(urls)
+
+    # Crawl and add to queue
     await crawl_parallel(urls)
+
+    # Start the queue worker
+    queue_worker = asyncio.create_task(process_queue())
+
+    # Wait for all chunks to be processed
+    await chunk_queue.join()
+
+    # Cancel the worker (it should be done by now)
+    queue_worker.cancel()
+    try:
+        await queue_worker
+    except asyncio.CancelledError:
+        pass
 
 if __name__ == "__main__":
     asyncio.run(main())

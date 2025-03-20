@@ -3,7 +3,7 @@ import json
 import asyncio
 import requests
 from xml.etree import ElementTree
-from typing import List, Dict, Any
+from typing import List, Dict, Any, List  # Ensure List is imported
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from urllib.parse import urlparse
@@ -12,12 +12,17 @@ from dotenv import load_dotenv
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
 from supabase import create_client, Client
 import google.generativeai as genai
+import re  # Import the regular expression module
 
 load_dotenv()
 
 # Initialize Gemini and Supabase clients
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-model_gemini = genai.GenerativeModel("gemini-pro")
+gemini_api_key = os.getenv("GOOGLE_API_KEY_N")
+print(f"API Key being used: {gemini_api_key}")
+
+genai.configure(api_key=gemini_api_key)
+
+model_gemini = genai.GenerativeModel("gemini-pro")  # Verify the model name
 
 supabase: Client = create_client(
     os.getenv("SUPABASE_URL"),
@@ -32,7 +37,7 @@ class ProcessedChunk:
     summary: str
     content: str
     metadata: Dict[str, Any]
-    embedding: str  # Changed type to str
+    embedding: List[float]  # Changed type to List[float]
 
 def chunk_text(text: str, chunk_size: int = 5000) -> List[str]:
     """Split text into chunks, respecting code blocks and paragraphs."""
@@ -82,41 +87,49 @@ def chunk_text(text: str, chunk_size: int = 5000) -> List[str]:
 async def get_title_and_summary(chunk: str, url: str) -> Dict[str, str]:
     """Extract title and summary using Gemini."""
     system_prompt_title_summary = """You are an AI that extracts titles and summaries from documentation chunks.
-    Return a JSON object with 'title' and 'summary' keys.
+    Return a JSON object with 'title' and 'summary' keys in JSON format.
     For the title: If this seems like the start of a document, extract its title. If it's a middle chunk, derive a descriptive title.
     For the summary: Create a concise summary of the main points in this chunk.
     Keep both title and summary concise but informative."""
 
     try:
         prompt = f"{system_prompt_title_summary}\nURL: {url}\n\nContent:\n{chunk[:1000]}..."  # Send first 1000 chars for context
-        response = model_gemini.generate_content(prompt, generation_config={"response_format": genai.ResponseFormat.JSON_ONLY})
-        return json.loads(response.text)
+        response = model_gemini.generate_content(prompt) # Removed response_format
+
+        # Basic JSON validation
+        try:
+            json_output = json.loads(response.text)
+            return json_output
+        except json.JSONDecodeError:
+            print("Invalid JSON received from Gemini for title/summary.")
+            return {"title": "Error processing title", "summary": "Error processing summary"}
+
     except Exception as e:
         print(f"Error getting title and summary: {e}")
         return {"title": "Error processing title", "summary": "Error processing summary"}
 
-async def get_embedding(text: str) -> str:  # Changed return type to str
-    """Get a text representation of the chunk using Gemini."""
-    system_prompt_embedding = """
-    You are an AI that generates concise text representations of documentation chunks.
-    Your goal is to capture the core meaning and key information of the chunk in a short text form.
-    Focus on preserving the essential information that would help someone understand the chunk's content.
-    Do not mention that you are an AI or this instruction.
+async def get_embedding(text: str) -> List[float]:
     """
-    try:
-        prompt = f"{system_prompt_embedding}\n\nContent:\n{text}"
-        response = model_gemini.generate_content(prompt)
-        return response.text
-    except Exception as e:
-        print(f"Error getting text representation: {e}")
-        return "Error processing text"  # Placeholder text
+    Get embedding vector.
+
+    This is a placeholder! You need to implement a proper embedding model.
+    For example, you could use a Sentence Transformer model.
+    """
+    # Replace this with your actual embedding generation code
+    # Example (Placeholder - replace with your actual embedding logic):
+    #   1. Call a local embedding model
+    #   2. Use a library like Sentence Transformers
+    #   3. Ensure the output is a list of floats
+    # For now, let's return a placeholder (a list of zeros with a fixed size)
+    embedding_size = 1536  # Or the size expected by your Supabase table
+    return [0.0] * embedding_size
 
 async def process_chunk(chunk: str, chunk_number: int, url: str) -> ProcessedChunk:
     """Process a single chunk of text."""
     # Get title and summary
     extracted = await get_title_and_summary(chunk, url)
 
-    # Get embedding (text representation)
+    # Get embedding
     embedding = await get_embedding(chunk)
 
     # Create metadata
@@ -148,7 +161,7 @@ async def insert_chunk(chunk: ProcessedChunk):
             "summary": chunk.summary,
             "content": chunk.content,
             "metadata": chunk.metadata,
-            "embedding": chunk.embedding  # Store text representation
+            "embedding": chunk.embedding  # Store the list of floats
         }
 
         result = supabase.table("site_pages").insert(data).execute()
@@ -191,6 +204,9 @@ async def crawl_parallel(urls: List[str], max_concurrent: int = 5):
     await crawler.start()
 
     try:
+        # Initialize Gemini and Supabase clients
+        genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))  # Configure Gemini
+        model_gemini = genai.GenerativeModel("gemini-pro")  # Initialize Gemini model
         # Create a semaphore to limit concurrency
         semaphore = asyncio.Semaphore(max_concurrent)
 

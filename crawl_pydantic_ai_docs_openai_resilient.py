@@ -1,4 +1,4 @@
-# import os
+import os
 import json
 import asyncio
 import requests
@@ -7,7 +7,7 @@ from typing import List, Dict, Any
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from urllib.parse import urlparse
-# from dotenv import load_dotenv
+from dotenv import load_dotenv
 import time
 import random
 from openai import AsyncOpenAI, RateLimitError
@@ -15,19 +15,132 @@ from openai import AsyncOpenAI, RateLimitError
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
 from supabase import create_client, Client
 
-from classes.processed_chunk import ProcessedChunk
-from classes.rate_limiter import RateLimiter
-from components.get_required_env_vars import get_required_env_var
+load_dotenv()
 
-from components.chunk_text import chunk_text
+@dataclass
+class ProcessedChunk:
+    url: str
+    chunk_number: int
+    title: str
+    summary: str
+    content: str
+    metadata: Dict[str, Any]
+    embedding: List[float]
+
+def get_required_env_var(name, default=None):
+    """Get an environment variable or exit if not available and no default provided.
+
+    Args:
+        name: The name of the environment variable
+        default: Optional default value to use if the variable is not set
+
+    Returns:
+        The value of the environment variable, or the default if provided
+
+    Raises:
+        SystemExit: If the variable is not set and no default is provided
+    """
+    print(f"Searching for {name} in the environment variables")
+    value = os.getenv(name)
+    print(f"Found value: {value} for {name}")
+    if value is None and default is None:
+        print(f"Error: Required environment variable {name} is not set", file=sys.stderr)
+        sys.exit(1)
+    return value
 
 
-# Initialize OpenAI and Supabase clients
-openai_client = AsyncOpenAI(api_key=get_required_env_var("OPENAI_API_KEY"))
+# Initialize OpenAI, Supabase clients and other variables
+openapi_key = str(get_required_env_var("OPENAI_API_KEY"))
+openai_client = AsyncOpenAI(api_key=openapi_key)
+supabase_key = str(get_required_env_var("SUPABASE_SERVICE_KEY"))
+supabase_url = str(get_required_env_var("SUPABASE_URL"))
 supabase: Client = create_client(
-    get_required_env_var("SUPABASE_URL"),
-    get_required_env_var("SUPABASE_SERVICE_KEY")
+    supabase_url,
+    supabase_key
 )
+topic = get_required_env_var("TOPIC", "mantine_ui_docs")
+site_url = get_required_env_var("SITE_URL", "https://storybook.js.org/sitemap.xml")
+ai_model=get_required_env_var("LLM_MODEL", "gpt-4o-mini"),
+
+def chunk_text(text: str, chunk_size: int = 5000) -> List[str]:
+    """Split text into chunks, respecting code blocks and paragraphs."""
+    chunks = []
+    start = 0
+    text_length = len(text)
+
+    while start < text_length:
+        # Calculate end position
+        end = start + chunk_size
+
+        # If we're at the end of the text, just take what's left
+        if end >= text_length:
+            chunks.append(text[start:].strip())
+            break
+
+        # Try to find a code block boundary first (```)
+        chunk = text[start:end]
+        code_block = chunk.rfind('```')
+        if code_block != -1 and code_block > chunk_size * 0.3:
+            end = start + code_block
+
+        # If no code block, try to break at a paragraph
+        elif '\n\n' in chunk:
+            # Find the last paragraph break
+            last_break = chunk.rfind('\n\n')
+            if last_break > chunk_size * 0.3:  # Only break if we're past 30% of chunk_size
+                end = start + last_break
+
+        # If no paragraph break, try to break at a sentence
+        elif '. ' in chunk:
+            # Find the last sentence break
+            last_period = chunk.rfind('. ')
+            if last_period > chunk_size * 0.3:
+                end = start + last_period + 1
+
+        # Extract chunk and clean it up
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+
+        # Move start position for next chunk
+        start = max(start + 1, end)
+
+    return chunks
+
+class RateLimiter:
+    """
+    Implements a token bucket algorithm for rate limiting.
+    """
+    def __init__(self, rate: float, capacity: float):
+        self.tokens = capacity
+        self.capacity = capacity
+        self.rate = rate
+        self.last_updated = self._current_time()
+        self.lock = asyncio.Lock()
+
+    def _current_time(self):
+        return time.monotonic()
+
+    async def refill(self):
+        """
+        Adds tokens to the bucket based on the elapsed time.
+        """
+        now = self._current_time()
+        elapsed = now - self.last_updated
+        self.last_updated = now
+        self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
+
+    async def acquire(self, tokens: float = 1):
+        """
+        Acquires tokens from the bucket, waiting if necessary.
+        """
+        async with self.lock:
+            while True:
+                await self.refill()
+                if self.tokens >= tokens:
+                    self.tokens -= tokens
+                    return
+                await asyncio.sleep(0.1)  # Yield to the event loop
 
 # Initialize RateLimiters based on Tier 1 limits
 # You'll need to adjust these based on the *exact* Tier 1 limits for your models!
@@ -57,14 +170,20 @@ async def get_title_and_summary(chunk: str, url: str, max_retries=10) -> Dict[st
             #  Acquire tokens before making the request
             await gpt_4o_mini_limiter.acquire()  # Assume 1 request = 1 token for simplicity
             response = await openai_client.chat.completions.create(
-                model=get_required_env_var("LLM_MODEL", "gpt-4o-mini"),
+                model=ai_model,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": f"URL: {url}\n\nContent:\n{chunk[:1000]}..."}
                 ],
                 response_format={"type": "json_object"}
             )
-            return json.loads(response.choices[0].message.content)
+            # Parse the JSON content from the response
+            try:
+                json_output = json.loads(response.choices[0].message.content)
+                return json_output
+            except (json.JSONDecodeError, TypeError) as e:
+                print(f"Error parsing JSON response: {e}, Raw content: {response.choices[0].message.content}")
+                return {"title": "Error processing title", "summary": "Error processing summary"}
 
         except RateLimitError as e:
             retries += 1
@@ -105,9 +224,8 @@ async def process_chunk(chunk: str, chunk_number: int, url: str) -> ProcessedChu
     embedding = await get_embedding(chunk)
 
     # Create metadata
-    source = get_required_env_var("TOPIC", "testing_ai_docs")
     metadata = {
-        "source": source,
+        "source": topic,
         "chunk_size": len(chunk),
         "crawled_at": datetime.now(timezone.utc).isoformat(),
         "url_path": urlparse(url).path
@@ -181,9 +299,8 @@ async def crawl_parallel(urls: List[str], max_concurrent: int = 3):  # Further r
 
 def get_pydantic_ai_docs_urls() -> List[str]:
     """Get URLs from Pydantic AI docs sitemap."""
-    sitemap_url = get_required_env_var("SITE_URL", "https://ai.pydantic.dev/sitemap.xml")
     try:
-        response = requests.get(sitemap_url)
+        response = requests.get(site_url)
         response.raise_for_status()
 
         # Parse the XML
@@ -207,6 +324,19 @@ async def add_to_queue(url: str, markdown: str):
     for i, chunk in enumerate(chunks):
         await chunk_queue.put({"url": url, "chunk": chunk, "chunk_number": i})
 
+async def is_chunk_processed(url: str, chunk_number: int) -> bool:
+    """
+    Checks if a chunk has already been processed and exists in the database.
+    """
+    try:
+        response = supabase.table("site_pages").select("*").eq("url", url).eq(
+            "chunk_number", chunk_number
+        ).execute()
+        return len(response.data) > 0
+    except Exception as e:
+        print(f"Error checking if chunk is processed: {e}")
+        return False
+
 async def process_queue():
     """Worker function to process chunks from the queue."""
     while True:
@@ -216,19 +346,20 @@ async def process_queue():
         chunk_number = item["chunk_number"]
 
         try:
-            processed_chunk = await process_chunk(chunk, chunk_number, url)
-            if processed_chunk:
-                await insert_chunk(processed_chunk)
+            #  Check if the chunk is already processed
+            if not await is_chunk_processed(url, chunk_number):
+                processed_chunk = await process_chunk(chunk, chunk_number, url)
+                if processed_chunk:
+                    await insert_chunk(processed_chunk)
+            else:
+                print(f"Chunk {chunk_number} for {url} already processed. Skipping.")
         except Exception as e:
             print(f"Error processing queue item: {e}")
         finally:
             chunk_queue.task_done()
 
 async def main():
-    print(f"Topic to use: {get_required_env_var('TOPIC')} from function")
-    print(f"Topic to use: {get_required_env_var('TOPIC')} from env")
-    print(f"Site URL to crawl {get_required_env_var('SITE_URL')} from function")
-    print(f"Site URL to crawl {get_required_env_var('SITE_URL')} from env")
+
     # Get URLs from Pydantic AI docs
     urls = get_pydantic_ai_docs_urls()
     if not urls:

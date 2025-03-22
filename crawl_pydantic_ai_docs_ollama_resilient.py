@@ -1,14 +1,12 @@
 import os
 import json
 import asyncio
-import requests
 import re
-import sys
-from xml.etree import ElementTree
-from typing import List, Dict, Any, List
-from dataclasses import dataclass
+from typing import List, Dict, Optional
 from datetime import datetime, timezone
 from urllib.parse import urlparse
+import requests
+
 from components.get_docs_url import get_docs_urls
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
 from supabase import create_client, Client
@@ -17,8 +15,8 @@ from classes.processed_chunk import ProcessedChunk
 from components.chunk_text import chunk_text
 from components.get_required_env_vars import get_required_env_var
 
-site_url = get_required_env_var("SITE_URL" , "https://storybook.js.org/sitemap.xml")
-topic = get_required_env_var("TOPIC" , "testing_ai_docs")
+site_url = get_required_env_var("SITE_URL", "https://storybook.js.org/sitemap.xml")
+topic = get_required_env_var("TOPIC", "testing_ai_docs")
 OLLAMA_MODEL = get_required_env_var("OLLAMA_MODEL", "llama2:chat")  # Default model
 embedding_size = int(get_required_env_var('EMBEDDING_SIZE', 768))  # Or choose a size appropriate for your needs
 # Initialize Supabase clients
@@ -101,6 +99,15 @@ def get_embedding_ollama(text: str) -> List[float]:
         print(f"Error getting embedding from Ollama: {e}")
         return [0] * embedding_size  # Placeholder embedding
 
+async def check_chunk_exists(url: str, chunk_number: int) -> bool:
+    """Check if a chunk already exists in the database."""
+    try:
+        result = supabase.table("site_pages").select("id").eq("url", url).eq("chunk_number", chunk_number).execute()
+        return len(result.data) > 0
+    except Exception as e:
+        print(f"Error checking if chunk exists: {e}")
+        return False
+
 async def process_chunk(chunk: str, chunk_number: int, url: str) -> ProcessedChunk:
     """Process a single chunk of text."""
     # Get title and summary
@@ -127,8 +134,8 @@ async def process_chunk(chunk: str, chunk_number: int, url: str) -> ProcessedChu
         embedding=embedding
     )
 
-async def insert_chunk(chunk: ProcessedChunk):
-    """Insert a processed chunk into Supabase."""
+async def insert_chunk(chunk: ProcessedChunk) -> bool:
+    """Insert a processed chunk into Supabase. Returns True if successful."""
     try:
         data = {
             "url": chunk.url,
@@ -142,32 +149,31 @@ async def insert_chunk(chunk: ProcessedChunk):
 
         result = supabase.table("site_pages").insert(data).execute()
         print(f"Inserted chunk {chunk.chunk_number} for {chunk.url}")
-        return result
+        return True
     except Exception as e:
         print(f"Error inserting chunk: {e}")
-        return None
+        return False
 
 async def process_and_store_document(url: str, markdown: str):
-    """Process a document and store its chunks in parallel."""
+    """Process a document and store its chunks, skipping those already in the database."""
     # Split into chunks
     chunks = chunk_text(markdown)
 
-    # Process chunks in parallel
-    tasks = [
-        process_chunk(chunk, i, url)
-        for i, chunk in enumerate(chunks)
-    ]
-    processed_chunks = await asyncio.gather(*tasks)
+    # Process each chunk only if it doesn't already exist
+    for i, chunk in enumerate(chunks):
+        # Check if chunk exists in the database
+        chunk_exists = await check_chunk_exists(url, i)
 
-    # Store chunks in parallel
-    insert_tasks = [
-        insert_chunk(chunk)
-        for chunk in processed_chunks
-    ]
-    await asyncio.gather(*insert_tasks)
+        if chunk_exists:
+            print(f"Skipping chunk {i} for {url} - already processed")
+            continue
 
-async def crawl_parallel(urls: List[str], max_concurrent: int = 5):
-    """Crawl multiple URLs in parallel with a concurrency limit."""
+        # Process and store the chunk
+        processed_chunk = await process_chunk(chunk, i, url)
+        await insert_chunk(processed_chunk)
+
+async def crawl_documents(urls: List[str], max_concurrent: int = 5):
+    """Crawl multiple URLs with a concurrency limit."""
     browser_config = BrowserConfig(
         headless=True,
         verbose=False,
@@ -178,22 +184,30 @@ async def crawl_parallel(urls: List[str], max_concurrent: int = 5):
     # Create the crawler instance
     crawler = AsyncWebCrawler(config=browser_config)
     await crawler.start()
+
     # Create a semaphore to limit concurrency
     semaphore = asyncio.Semaphore(max_concurrent)
 
     async def process_url(url: str):
         try:
             async with semaphore:
-                result = await crawler.arun(
+                # Check if any chunks from this URL already exist
+                result = supabase.table("site_pages").select("url").eq("url", url).limit(1).execute()
+                if result.data:
+                    print(f"URL {url} has been partially or fully processed before")
+
+                # Crawl the URL
+                crawl_result = await crawler.arun(
                     url=url,
                     config=crawl_config,
                     session_id="session1"
                 )
-                if result.success:
+
+                if crawl_result.success:
                     print(f"Successfully crawled: {url}")
-                    await process_and_store_document(url, result.markdown_v2.raw_markdown)
+                    await process_and_store_document(url, crawl_result.markdown_v2.raw_markdown)
                 else:
-                    print(f"Failed: {url} - Error: {result.error_message}")
+                    print(f"Failed: {url} - Error: {crawl_result.error_message}")
         except asyncio.CancelledError:
             print(f"Cancelled processing of {url}")
             raise
@@ -212,14 +226,13 @@ async def crawl_parallel(urls: List[str], max_concurrent: int = 5):
         # Wait for all tasks to complete, ignoring cancellation errors
         await asyncio.gather(*tasks, return_exceptions=True)
         raise
-        await asyncio.gather(*[process_url(url) for url in urls])
     finally:
         await crawler.close()
 
 
 async def main():
     try:
-        # Get URLs from Pydantic AI docs
+        # Get URLs from docs
         urls = get_docs_urls(site_url)
         if not urls:
             print("No URLs found to crawl")
@@ -229,7 +242,7 @@ async def main():
 
         # Create a task group for better task management
         async with asyncio.TaskGroup() as tg:
-            task = tg.create_task(crawl_parallel(urls, int(os.getenv('MAX_CONCURRENT_TASKS',3))))
+            task = tg.create_task(crawl_documents(urls, int(os.getenv('MAX_CONCURRENT_TASKS', 3))))
 
             try:
                 await task
@@ -250,11 +263,6 @@ async def main():
         print("Cleanup complete")
 
 if __name__ == "__main__":
-    print(f"Topic to use: {get_required_env_var("TOPIC")} from function")
-    print(f"Topic to use: {os.getenv("TOPIC")} from env")
-    print(f"Site URL to crawl {get_required_env_var("SITE_URL")} from function")
-    print(f"Site URL to crawl {os.getenv("SITE_URL")} from env")
-
     try:
         asyncio.run(main())
     except KeyboardInterrupt:

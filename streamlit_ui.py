@@ -3,6 +3,7 @@ from typing import Literal, TypedDict
 import asyncio
 import os
 
+import mantine_ui_expert
 import streamlit as st
 import json
 import logfire
@@ -22,7 +23,7 @@ from pydantic_ai.messages import (
     RetryPromptPart,
     ModelMessagesTypeAdapter
 )
-from pydantic_ai_expert import pydantic_ai_expert, PydanticAIDeps
+from mantine_ui_expert import mantine_ui_expert, PydanticAIDeps
 
 # Load environment variables
 from dotenv import load_dotenv
@@ -62,7 +63,7 @@ def display_message_part(part):
     # text
     elif part.part_kind == 'text':
         with st.chat_message("assistant"):
-            st.markdown(part.content)          
+            st.markdown(part.content)
 
 
 async def run_agent_with_streaming(user_input: str):
@@ -77,7 +78,7 @@ async def run_agent_with_streaming(user_input: str):
     )
 
     # Run the agent in a stream
-    async with pydantic_ai_expert.run_stream(
+    async with mantine_ui_expert.run_stream(
         user_input,
         deps=deps,
         message_history= st.session_state.messages[:-1],  # pass entire conversation so far
@@ -93,8 +94,8 @@ async def run_agent_with_streaming(user_input: str):
 
         # Now that the stream is finished, we have a final result.
         # Add new messages from this run, excluding user-prompt messages
-        filtered_messages = [msg for msg in result.new_messages() 
-                            if not (hasattr(msg, 'parts') and 
+        filtered_messages = [msg for msg in result.new_messages()
+                            if not (hasattr(msg, 'parts') and
                                     any(part.part_kind == 'user-prompt' for part in msg.parts))]
         st.session_state.messages.extend(filtered_messages)
 
@@ -128,7 +129,7 @@ async def main():
         st.session_state.messages.append(
             ModelRequest(parts=[UserPromptPart(content=user_input)])
         )
-        
+
         # Display user prompt in the UI
         with st.chat_message("user"):
             st.markdown(user_input)
